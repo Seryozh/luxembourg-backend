@@ -1,20 +1,15 @@
-"""
-Two-model LangGraph agent.
-
-Model 1 (Orchestrator): Reads project map, explores via tools, creates a task.
-Model 2 (Worker): Receives the task, reads scripts, generates code changes.
-
-Uses OpenRouter for both models via the OpenAI-compatible API.
-"""
-
 import logging
+import json
 
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
 from langgraph.graph import StateGraph, START, END
-from langgraph.prebuilt import ToolNode
 from typing import TypedDict, Annotated
 from operator import add
+
+from session import Session
+from tools import get_metadata, get_full_script
+from config import settings
 
 log = logging.getLogger("luxembourg")
 logging.basicConfig(
@@ -23,26 +18,17 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 
-from session import Session
-from tools import get_metadata, get_full_script
-
-
-# --- LangGraph State ---
-# This is what flows through the graph. Each node can read and write to it.
 
 class AgentState(TypedDict):
     session: Session
     user_message: str
-    orchestrator_messages: Annotated[list, add]  # Model 1's message history
-    worker_task: str  # The task Model 1 creates for Model 2
-    worker_messages: Annotated[list, add]  # Model 2's message history
-    final_response: dict  # The structured JSON result
+    orchestrator_messages: Annotated[list, add]
+    worker_task: str
+    worker_messages: Annotated[list, add]
+    final_response: dict
 
-
-# --- Model setup ---
 
 def make_orchestrator(openrouter_key: str) -> ChatOpenAI:
-    """Cheap, fast model for exploration and task creation."""
     return ChatOpenAI(
         model="google/gemini-3-flash-preview",
         openai_api_key=openrouter_key,
@@ -52,7 +38,6 @@ def make_orchestrator(openrouter_key: str) -> ChatOpenAI:
 
 
 def make_worker(openrouter_key: str) -> ChatOpenAI:
-    """Smart model for code generation."""
     return ChatOpenAI(
         model="google/gemini-3-flash-preview",
         openai_api_key=openrouter_key,
@@ -60,8 +45,6 @@ def make_worker(openrouter_key: str) -> ChatOpenAI:
         temperature=0,
     )
 
-
-# --- System prompts ---
 
 ORCHESTRATOR_SYSTEM = """You are an AI assistant that helps modify Roblox games.
 
@@ -129,44 +112,34 @@ Rules:
 - Each action should be a single logical step that the user can approve or deny individually. Break complex tasks into multiple actions rather than one giant action."""
 
 
-# --- Graph nodes ---
-# Each function is a "node" in the graph. LangGraph calls them in order.
-
 async def orchestrator_node(state: AgentState) -> dict:
-    """Model 1 explores the project and creates a task for Model 2."""
     log.info("=" * 60)
     log.info("ORCHESTRATOR START")
     log.info(f"User message: {state['user_message']}")
     log.info(f"Project map:\n{state['session'].project_map[:500]}")
     log.info(f"Conversation history: {len(state['session'].conversation_history)} messages")
+
     session = state["session"]
     llm = make_orchestrator(session.openrouter_key)
 
-    # Build the tools Model 1 can use (bound to this session)
     async def _get_metadata(script_name: str) -> str:
-        """Get a ~100 word description of what a script does."""
         return await get_metadata(session, script_name)
 
     async def _get_full_script(script_name: str) -> str:
-        """Get the complete source code of a script."""
         return await get_full_script(session, script_name)
 
     llm_with_tools = llm.bind_tools([_get_metadata, _get_full_script])
 
-    # Build messages: system prompt + conversation history + current request
     messages = [SystemMessage(content=ORCHESTRATOR_SYSTEM)]
 
-    # Add conversation history (so Model 1 has context from previous messages)
-    for msg in session.conversation_history[:-1]:  # exclude current message
+    for msg in session.conversation_history[:-1]:
         messages.append(HumanMessage(content=msg["content"]) if msg["role"] == "user"
                        else SystemMessage(content=msg["content"]))
 
-    # Current request with project map
     messages.append(HumanMessage(
         content=f"Project Map:\n{session.project_map}\n\nUser Request: {state['user_message']}"
     ))
 
-    # Let Model 1 think and use tools in a loop
     loop_count = 0
     while True:
         loop_count += 1
@@ -175,7 +148,6 @@ async def orchestrator_node(state: AgentState) -> dict:
         messages.append(response)
         log.info(f"ORCHESTRATOR response: {response.content[:300]}...")
 
-        # If Model 1 made tool calls, execute them and continue
         if response.tool_calls:
             for tool_call in response.tool_calls:
                 func_name = tool_call["name"]
@@ -188,11 +160,9 @@ async def orchestrator_node(state: AgentState) -> dict:
                 else:
                     result = f"Unknown tool: {func_name}"
                 log.info(f"ORCHESTRATOR tool result: {result[:200]}...")
-                from langchain_core.messages import ToolMessage
                 messages.append(ToolMessage(content=result, tool_call_id=tool_call["id"]))
             continue
 
-        # No tool calls — check for chat reply (no code needed)
         content = response.content
         if "<chat_reply>" in content and "</chat_reply>" in content:
             reply = content.split("<chat_reply>")[1].split("</chat_reply>")[0].strip()
@@ -203,7 +173,6 @@ async def orchestrator_node(state: AgentState) -> dict:
                 "final_response": {"description": reply},
             }
 
-        # Check if Model 1 produced a task
         if "<worker_task>" in content and "</worker_task>" in content:
             task = content.split("<worker_task>")[1].split("</worker_task>")[0].strip()
             log.info(f"ORCHESTRATOR → worker task:\n{task}")
@@ -212,7 +181,6 @@ async def orchestrator_node(state: AgentState) -> dict:
                 "worker_task": task,
             }
 
-        # Model 1 responded without a task or tool calls — prompt it to decide
         log.info("ORCHESTRATOR — no task or tools, nudging...")
         messages.append(HumanMessage(
             content="Please either use a tool to explore further, or write your <worker_task> if you have enough information."
@@ -220,27 +188,27 @@ async def orchestrator_node(state: AgentState) -> dict:
 
 
 async def worker_node(state: AgentState) -> dict:
-    """Model 2 receives the task and generates code."""
     log.info("=" * 60)
     log.info("WORKER START")
     log.info(f"Task:\n{state['worker_task'][:500]}")
+
     session = state["session"]
     llm = make_worker(session.openrouter_key)
 
     async def _get_full_script(script_name: str) -> str:
-        """Get the complete source code of a script."""
         return await get_full_script(session, script_name)
 
     llm_with_tools = llm.bind_tools([_get_full_script])
 
-    # Worker gets ONLY the task — fresh context, no history
     messages = [
         SystemMessage(content=WORKER_SYSTEM),
         HumanMessage(content=state["worker_task"]),
     ]
 
-    # Let Model 2 use tools and generate
     loop_count = 0
+    max_retries = settings.max_json_retries
+    json_retry_count = 0
+
     while True:
         loop_count += 1
         log.info(f"WORKER loop {loop_count} — calling LLM...")
@@ -250,20 +218,21 @@ async def worker_node(state: AgentState) -> dict:
         if response.tool_calls:
             for tool_call in response.tool_calls:
                 log.info(f"WORKER tool call: get_full_script({tool_call['args']})")
-                # Extract just script_name, ignore any extra args the model sends
-                script_name = tool_call["args"].get("script_name", tool_call["args"].get("name", ""))
-                result = await _get_full_script(script_name)
-                log.info(f"WORKER tool result: {result[:200]}...")
-                from langchain_core.messages import ToolMessage
+                # Standardize parameter name (accept both script_name and name for backward compatibility)
+                args = tool_call["args"]
+                script_name = args.get("script_name") or args.get("name") or ""
+                if not script_name:
+                    log.error(f"WORKER tool call missing script_name parameter: {args}")
+                    result = "Error: script_name parameter is required"
+                else:
+                    result = await _get_full_script(script_name)
+                    log.info(f"WORKER tool result: {result[:200]}...")
                 messages.append(ToolMessage(content=result, tool_call_id=tool_call["id"]))
             continue
 
-        # No tool calls — Model 2 is done, parse the JSON response
-        import json
         content = response.content
         log.info(f"WORKER raw response: {content[:500]}...")
 
-        # Try to extract JSON from the response
         try:
             if "```json" in content:
                 content = content.split("```json")[1].split("```")[0]
@@ -271,7 +240,17 @@ async def worker_node(state: AgentState) -> dict:
                 content = content.split("```")[1].split("```")[0]
             result = json.loads(content.strip())
         except json.JSONDecodeError:
-            log.warning("WORKER — JSON parse failed, asking for retry")
+            json_retry_count += 1
+            if json_retry_count >= max_retries:
+                log.error(f"WORKER — JSON parse failed after {max_retries} retries, returning error")
+                return {
+                    "worker_messages": messages,
+                    "final_response": {
+                        "actions": [],
+                        "description": "Sorry, I couldn't generate valid actions. Please try rephrasing your request.",
+                    },
+                }
+            log.warning(f"WORKER — JSON parse failed (attempt {json_retry_count}/{max_retries}), asking for retry")
             messages.append(HumanMessage(
                 content="Your response was not valid JSON. Please respond with ONLY the JSON object in the format specified."
             ))
@@ -285,35 +264,24 @@ async def worker_node(state: AgentState) -> dict:
         }
 
 
-# --- Build the graph ---
-
 def should_run_worker(state: AgentState) -> str:
-    """Skip worker if orchestrator already produced a final response (chat reply)."""
     if state.get("final_response"):
         return END
     return "worker"
 
 
 def build_graph():
-    """Create the LangGraph workflow: Orchestrator → Worker (conditional)."""
     graph = StateGraph(AgentState)
-
     graph.add_node("orchestrator", orchestrator_node)
     graph.add_node("worker", worker_node)
-
     graph.add_edge(START, "orchestrator")
     graph.add_conditional_edges("orchestrator", should_run_worker)
     graph.add_edge("worker", END)
-
     return graph.compile()
 
 
-# --- Entry point ---
-
 async def run_agent(session: Session, user_message: str) -> dict:
-    """Run the full two-model agent and return the structured response."""
     graph = build_graph()
-
     result = await graph.ainvoke({
         "session": session,
         "user_message": user_message,
@@ -322,5 +290,4 @@ async def run_agent(session: Session, user_message: str) -> dict:
         "worker_messages": [],
         "final_response": {},
     })
-
     return result["final_response"]

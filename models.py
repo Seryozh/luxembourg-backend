@@ -1,51 +1,53 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
-
-# --- Plugin → Backend ---
 
 class ChatRequest(BaseModel):
-    """What the plugin sends when the user hits 'send'."""
-    session_id: str
-    user_message: str
-    project_map: str  # the game tree as text (names, types, hierarchy)
-    openrouter_key: str
+    """Request model for /chat endpoint."""
+    session_id: str = Field(..., min_length=1, max_length=128, description="Unique session identifier")
+    user_message: str = Field(..., min_length=1, max_length=10000, description="User's message")
+    project_map: str = Field(..., max_length=100000, description="Roblox project structure map")
+    openrouter_key: str = Field(..., min_length=1, description="OpenRouter API key")
+
+    @field_validator("openrouter_key")
+    @classmethod
+    def validate_api_key(cls, v: str) -> str:
+        """Ensure API key looks valid."""
+        if not v or len(v) < 10:
+            raise ValueError("OpenRouter API key appears invalid")
+        return v
 
 
 class PluginPollResponse(BaseModel):
-    """What the plugin sends back when fulfilling a pending request."""
-    session_id: str
-    request_id: str
-    data: dict  # the metadata or script content the agent asked for
+    """Response model from plugin to /poll/{session_id}/respond endpoint."""
+    session_id: str = Field(..., min_length=1)
+    request_id: str = Field(..., min_length=1)
+    data: dict = Field(default_factory=dict)
 
-
-# --- Backend → Plugin ---
 
 class PendingRequest(BaseModel):
-    """A request the agent needs the plugin to fulfill."""
+    """Pending request from agent to plugin."""
     request_id: str
-    request_type: str  # "get_metadata" or "get_full_script"
-    target: str  # script name or path
+    request_type: str = Field(..., pattern="^(get_metadata|get_full_script)$")
+    target: str = Field(..., min_length=1)
 
 
 class Action(BaseModel):
-    """A single action the agent wants to perform in Studio."""
-    type: str        # "set_property", "create_instance", "delete_instance",
-                     # "modify_script", "create_script", "delete_script",
-                     # "move_instance", "clone_instance"
-    target: str      # instance path, e.g. "game.Lighting" or "game.Workspace.Enemy"
-    properties: dict = {}  # property name → value pairs
-    # For scripts:
-    source: str = ""       # script source code (for create_script / modify_script)
-    # For create_instance:
-    class_name: str = ""   # e.g. "Part", "Script", "RemoteEvent"
-    name: str = ""         # name of the new instance
-    # For move_instance:
-    new_parent: str = ""   # new parent path
+    """Action to execute in Roblox Studio. Represents a single modification."""
+    type: str = Field(
+        ...,
+        pattern="^(set_property|create_instance|delete_instance|move_instance|clone_instance|create_script|modify_script|delete_script)$"
+    )
+    target: str = Field(..., min_length=1, description="Target instance path (e.g. 'game.Workspace.Part')")
+    properties: dict = Field(default_factory=dict)
+    source: str = ""
+    class_name: str = ""
+    name: str = ""
+    new_parent: str = ""
 
 
 class ChatResponse(BaseModel):
-    """What the backend returns to the plugin after the agent finishes."""
+    """Response from /chat endpoint with agent's message and actions."""
     session_id: str
-    message: str  # the text response for the user
-    actions: list[Action] = []
-    metadata_updates: dict[str, str] = {}  # script name → updated description
+    message: str = Field(..., min_length=1)
+    actions: list[Action] = Field(default_factory=list)
+    metadata_updates: dict[str, str] = Field(default_factory=dict)
