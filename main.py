@@ -13,6 +13,7 @@ from models import (
     ChatResponse,
     PendingRequest,
     PluginPollResponse,
+    PluginRequestResponse,
 )
 from session import get_or_create_session, get_session, cleanup_expired_sessions, get_session_count
 from agent import run_agent
@@ -122,18 +123,15 @@ async def chat(request: ChatRequest):
     )
 
 
-@app.get("/poll/{session_id}")
+@app.get("/poll/{session_id}", response_model=PluginPollResponse)
 async def poll(session_id: str):
     """
     Polling endpoint for the plugin to check for pending requests from the agent.
-
-    The agent uses this to request script metadata or full script contents from
-    the plugin. Returns array of pending requests with type (get_metadata, get_full_script)
-    and target (script name/path).
+    Also returns any queued actions for incremental execution.
     """
     session = get_session(session_id)
     if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
+        return PluginPollResponse(pending_requests=[], queued_actions=[])
 
     pending = [
         PendingRequest(
@@ -143,11 +141,16 @@ async def poll(session_id: str):
         )
         for rid, info in session.pending_requests.items()
     ]
-    return {"pending_requests": pending}
+
+    # Get queued actions and clear the queue
+    actions = [Action(**a) for a in session.action_queue]
+    session.action_queue = []
+
+    return PluginPollResponse(pending_requests=pending, queued_actions=actions)
 
 
 @app.post("/poll/{session_id}/respond")
-async def poll_respond(session_id: str, response: PluginPollResponse):
+async def poll_respond(session_id: str, response: PluginRequestResponse):
     """
     Response endpoint for the plugin to send back requested data.
 

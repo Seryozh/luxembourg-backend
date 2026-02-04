@@ -17,7 +17,7 @@ class ChatRequest(BaseModel):
         return v
 
 
-class PluginPollResponse(BaseModel):
+class PluginRequestResponse(BaseModel):
     """Response model from plugin to /poll/{session_id}/respond endpoint."""
     session_id: str = Field(..., min_length=1)
     request_id: str = Field(..., min_length=1)
@@ -27,7 +27,7 @@ class PluginPollResponse(BaseModel):
 class PendingRequest(BaseModel):
     """Pending request from agent to plugin."""
     request_id: str
-    request_type: str = Field(..., pattern="^(get_metadata|get_full_script)$")
+    request_type: str = Field(..., pattern="^(get_metadata|get_full_script|list_children|search_project)$")
     target: str = Field(..., min_length=1)
 
 
@@ -43,6 +43,7 @@ class Action(BaseModel):
     class_name: str = ""
     name: str = ""
     new_parent: str = ""
+    original_hash: str = ""
 
 
 class ChatResponse(BaseModel):
@@ -51,3 +52,9 @@ class ChatResponse(BaseModel):
     message: str = Field(..., min_length=1)
     actions: list[Action] = Field(default_factory=list)
     metadata_updates: dict[str, str] = Field(default_factory=dict)
+
+
+class PluginPollResponse(BaseModel):
+    """Response model for the /poll/{session_id} endpoint."""
+    pending_requests: list[PendingRequest] = Field(default_factory=list)
+    queued_actions: list[Action] = Field(default_factory=list)
