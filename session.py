@@ -17,6 +17,8 @@ class Session:
     pending_requests: dict[str, dict] = field(default_factory=dict)
     fulfilled_responses: dict[str, asyncio.Event] = field(default_factory=dict)
     fulfilled_data: dict[str, dict] = field(default_factory=dict)
+    action_queue: list[dict] = field(default_factory=list)
+    pending_creations: dict[str, dict] = field(default_factory=dict)  # Track recently created objects
     created_at: float = field(default_factory=time.time)
     last_accessed: float = field(default_factory=time.time)
 

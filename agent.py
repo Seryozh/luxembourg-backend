@@ -8,7 +8,7 @@ from typing import TypedDict, Annotated
 from operator import add
 
 from session import Session
-from tools import get_metadata, get_full_script
+from tools import search_project, list_children, get_metadata, get_full_script
 from config import settings
 
 log = logging.getLogger("luxembourg")
@@ -22,13 +22,11 @@ logging.basicConfig(
 class AgentState(TypedDict):
     session: Session
     user_message: str
-    orchestrator_messages: Annotated[list, add]
-    worker_task: str
-    worker_messages: Annotated[list, add]
+    messages: Annotated[list, add]
     final_response: dict
 
 
-def make_orchestrator(openrouter_key: str) -> ChatOpenAI:
+def make_agent(openrouter_key: str) -> ChatOpenAI:
     return ChatOpenAI(
         model="google/gemini-3-flash-preview",
         openai_api_key=openrouter_key,
@@ -37,90 +35,75 @@ def make_orchestrator(openrouter_key: str) -> ChatOpenAI:
     )
 
 
-def make_worker(openrouter_key: str) -> ChatOpenAI:
-    return ChatOpenAI(
-        model="google/gemini-3-flash-preview",
-        openai_api_key=openrouter_key,
-        openai_api_base="https://openrouter.ai/api/v1",
-        temperature=0,
-    )
+def format_pending_creations(pending: dict) -> str:
+    """Format pending creations for system prompt"""
+    if not pending:
+        return "None"
+
+    lines = []
+    for name, info in pending.items():
+        lines.append(f"  - {info['target']} ({info['type']}{', name: ' + name if name else ''})")
+    return "\n".join(lines)
 
 
-ORCHESTRATOR_SYSTEM = """You are an AI assistant that helps modify Roblox games.
+UNIFIED_SYSTEM = """Expert Roblox Studio AI with full game control.
 
-You receive the project map (the game tree showing all objects, scripts, and hierarchy) and the user's request.
+IMPORTANT: You receive a PARTIAL VIEW of the project (top-level containers only). Use tools to explore and locate scripts.
 
-Your job:
-1. Analyze the user's request and determine what kind of task it is:
-   - Property changes (lighting, terrain, atmosphere) → NO scripts needed
-   - Creating instances (parts, models, UI) → NO scripts needed
-   - Game logic (movement, combat, AI, events) → scripts ARE needed
-2. ONLY use get_metadata/get_full_script if the task genuinely involves reading or modifying existing scripts. Do NOT read scripts for tasks like "change the sky color" or "add a part to workspace".
-3. Write a clear, detailed task for the Worker model.
+Tools:
+- search_project(query): Search for scripts by name (e.g., "healing" finds "HealPlayer" script with full path)
+- list_children(path): List contents of a game path (e.g., "game.Workspace" or "game.ServerScriptService")
+- get_metadata(script_name): Preview script (type, location, lines, deps, first few lines)
+- get_full_script(script_name): Read full source (returns Path, Hash, and Source - extract Hash for modify_script!)
 
-IMPORTANT: Be efficient. If the user asks to change a property or create an instance, just describe the task — don't explore scripts that aren't relevant.
+Best Practice: Use search_project() first to locate scripts by name, then get_full_script() to read them.
+Only use tools for game logic tasks, not simple property/instance changes.
 
-When you are done, respond with your task wrapped in <worker_task> tags:
-<worker_task>
-Your detailed task here...
-</worker_task>
+HASH VERIFICATION: get_full_script() returns a "Hash: ..." line. When creating modify_script actions, copy this hash value to original_hash field to prevent data loss from concurrent edits.
 
-If the user's message is conversational (like "hi", "thanks", questions about the project) and does NOT require any changes, respond with a <chat_reply> tag instead:
-<chat_reply>
-Your conversational response here...
-</chat_reply>"""
+Output:
+- Conversational: Plain text
+- Modifications: JSON with actions array
 
-WORKER_SYSTEM = """You are an expert Roblox Studio AI with full control over the game.
+JSON Format:
+{"actions": [<action_objects>], "description": "summary", "metadata_updates": {}}
 
-You receive a task describing what to build or modify. Use get_full_script to read any scripts you need.
-
-You have FULL control over Roblox Studio. You can:
-- Set properties on any instance (lighting, terrain, parts, UI, etc.)
-- Create any instance (Parts, Models, Scripts, UI elements, RemoteEvents, etc.)
-- Delete instances
-- Move/reparent instances
-- Clone instances
-- Create, modify, or delete scripts
-
-You MUST respond with valid JSON containing an "actions" array and a "description":
-{
-  "actions": [
-    {"type": "set_property", "target": "game.Lighting", "properties": {"ClockTime": 0, "Brightness": 1}},
-    {"type": "create_instance", "target": "game.Workspace", "class_name": "Part", "name": "Floor", "properties": {"Size": [100, 1, 100], "Position": [0, 0, 0], "Anchored": true}},
-    {"type": "delete_instance", "target": "game.Workspace.OldPart"},
-    {"type": "move_instance", "target": "game.Workspace.MyModel", "new_parent": "game.ServerStorage"},
-    {"type": "clone_instance", "target": "game.ServerStorage.Template", "new_parent": "game.Workspace", "name": "Clone1"},
-    {"type": "create_script", "target": "game.ServerScriptService", "name": "GameManager", "class_name": "Script", "source": "print('hello')"},
-    {"type": "modify_script", "target": "game.ServerScriptService.GameManager", "source": "full new source code"},
-    {"type": "delete_script", "target": "game.ServerScriptService.GameManager"}
-  ],
-  "description": "What was changed and why",
-  "metadata_updates": {}
-}
+Action Types:
+- set_property: {"type": "set_property", "target": "game.Lighting", "properties": {"ClockTime": 0}}
+- create_instance: {"type": "create_instance", "target": "game.Workspace", "class_name": "Part", "name": "Floor", "properties": {"Size": [100,1,100], "Anchored": true}}
+- delete_instance: {"type": "delete_instance", "target": "game.Workspace.OldPart"}
+- move_instance: {"type": "move_instance", "target": "game.Workspace.Model", "new_parent": "game.ServerStorage"}
+- clone_instance: {"type": "clone_instance", "target": "game.ServerStorage.Template", "new_parent": "game.Workspace", "name": "Clone1"}
+- create_script: {"type": "create_script", "target": "game.ServerScriptService", "name": "Manager", "class_name": "Script", "source": "code"}
+- modify_script: {"type": "modify_script", "target": "game.ServerScriptService.Manager", "source": "full_code", "original_hash": "hash_from_get_full_script"}
+- delete_script: {"type": "delete_script", "target": "game.ServerScriptService.Manager"}
 
 Rules:
-- Use DIRECT property changes when possible (like setting ClockTime) instead of creating scripts.
-- Only create scripts when actual runtime game logic is needed.
-- For Vector3 values, use arrays: [x, y, z]. For Color3, use arrays: [r, g, b] (0-255).
-- For UDim2, use arrays: [xScale, xOffset, yScale, yOffset].
-- For BrickColor, use the name string: "Bright red".
-- For Enum values, use strings: "Enum.Material.Grass".
-- Always use full instance paths starting with "game."
-- Include COMPLETE source code for modified scripts.
-- Keep descriptions concise.
-- When creating instances, set ALL relevant properties (Size, Position, Color, Material, Anchored, etc.). Be thorough — don't leave default values if the user expects something specific.
-- Each action should be a single logical step that the user can approve or deny individually. Break complex tasks into multiple actions rather than one giant action."""
+- Prefer direct property changes over scripts
+- Vector3/Color3/UDim2: use arrays [x,y,z] / [r,g,b 0-255] / [xS,xO,yS,yO]
+- BrickColor: "Bright red", Enums: "Enum.Material.Grass"
+- Full paths from "game.", complete source for script modifications
+- Set all relevant properties on create, break complex tasks into multiple actions
+- CRITICAL: When modifying scripts, you MUST first call get_full_script() to read the current source, then include the hash in the modify_script action to prevent data loss"""
 
 
-async def orchestrator_node(state: AgentState) -> dict:
+async def unified_agent_node(state: AgentState) -> dict:
+    """Single agent that handles all requests - conversational and modifications"""
     log.info("=" * 60)
-    log.info("ORCHESTRATOR START")
+    log.info("AGENT START")
     log.info(f"User message: {state['user_message']}")
     log.info(f"Project map:\n{state['session'].project_map[:500]}")
     log.info(f"Conversation history: {len(state['session'].conversation_history)} messages")
 
     session = state["session"]
-    llm = make_orchestrator(session.openrouter_key)
+    llm = make_agent(session.openrouter_key)
+
+    # Bind tools with session context
+    async def _search_project(query: str) -> str:
+        return await search_project(session, query)
+
+    async def _list_children(path: str) -> str:
+        return await list_children(session, path)
 
     async def _get_metadata(script_name: str) -> str:
         return await get_metadata(session, script_name)
@@ -128,166 +111,226 @@ async def orchestrator_node(state: AgentState) -> dict:
     async def _get_full_script(script_name: str) -> str:
         return await get_full_script(session, script_name)
 
-    llm_with_tools = llm.bind_tools([_get_metadata, _get_full_script])
+    llm_with_tools = llm.bind_tools([_search_project, _list_children, _get_metadata, _get_full_script])
 
-    messages = [SystemMessage(content=ORCHESTRATOR_SYSTEM)]
-
-    for msg in session.conversation_history[:-1]:
-        messages.append(HumanMessage(content=msg["content"]) if msg["role"] == "user"
-                       else SystemMessage(content=msg["content"]))
-
-    messages.append(HumanMessage(
-        content=f"Project Map:\n{session.project_map}\n\nUser Request: {state['user_message']}"
-    ))
-
-    loop_count = 0
-    while True:
-        loop_count += 1
-        log.info(f"ORCHESTRATOR loop {loop_count} — calling LLM...")
-        response = await llm_with_tools.ainvoke(messages)
-        messages.append(response)
-        log.info(f"ORCHESTRATOR response: {response.content[:300]}...")
-
-        if response.tool_calls:
-            for tool_call in response.tool_calls:
-                func_name = tool_call["name"]
-                args = tool_call["args"]
-                log.info(f"ORCHESTRATOR tool call: {func_name}({args})")
-                if func_name == "_get_metadata":
-                    result = await _get_metadata(**args)
-                elif func_name == "_get_full_script":
-                    result = await _get_full_script(**args)
-                else:
-                    result = f"Unknown tool: {func_name}"
-                log.info(f"ORCHESTRATOR tool result: {result[:200]}...")
-                messages.append(ToolMessage(content=result, tool_call_id=tool_call["id"]))
-            continue
-
-        content = response.content
-        if "<chat_reply>" in content and "</chat_reply>" in content:
-            reply = content.split("<chat_reply>")[1].split("</chat_reply>")[0].strip()
-            log.info(f"ORCHESTRATOR → chat reply: {reply}")
-            return {
-                "orchestrator_messages": messages,
-                "worker_task": "",
-                "final_response": {"description": reply},
-            }
-
-        if "<worker_task>" in content and "</worker_task>" in content:
-            task = content.split("<worker_task>")[1].split("</worker_task>")[0].strip()
-            log.info(f"ORCHESTRATOR → worker task:\n{task}")
-            return {
-                "orchestrator_messages": messages,
-                "worker_task": task,
-            }
-
-        log.info("ORCHESTRATOR — no task or tools, nudging...")
-        messages.append(HumanMessage(
-            content="Please either use a tool to explore further, or write your <worker_task> if you have enough information."
-        ))
-
-
-async def worker_node(state: AgentState) -> dict:
-    log.info("=" * 60)
-    log.info("WORKER START")
-    log.info(f"Task:\n{state['worker_task'][:500]}")
-
-    session = state["session"]
-    llm = make_worker(session.openrouter_key)
-
-    async def _get_full_script(script_name: str) -> str:
-        return await get_full_script(session, script_name)
-
-    llm_with_tools = llm.bind_tools([_get_full_script])
+    # Build message history
+    pending_context = ""
+    if session.pending_creations:
+        pending_context = f"\n\n# Recently Created Objects (not yet in project map)\n{format_pending_creations(session.pending_creations)}"
 
     messages = [
-        SystemMessage(content=WORKER_SYSTEM),
-        HumanMessage(content=state["worker_task"]),
+        SystemMessage(content=UNIFIED_SYSTEM),
+        # Project map as separate system message for better caching
+        SystemMessage(content=f"# Current Project Structure\n{session.project_map}{pending_context}")
     ]
 
-    loop_count = 0
-    max_retries = settings.max_json_retries
-    json_retry_count = 0
+    # Include recent conversation history with sliding window (last 10 messages)
+    MAX_HISTORY_MESSAGES = 10
+    recent_history = session.conversation_history[:-1]
+    if len(recent_history) > MAX_HISTORY_MESSAGES:
+        recent_history = recent_history[-MAX_HISTORY_MESSAGES:]
 
-    while True:
+    for msg in recent_history:
+        messages.append(
+            HumanMessage(content=msg["content"])
+            if msg["role"] == "user"
+            else SystemMessage(content=msg["content"])
+        )
+
+    # Add current request WITHOUT project map (it's already in system message)
+    messages.append(HumanMessage(content=state['user_message']))
+
+    # Agentic loop
+    loop_count = 0
+    max_loops = 8  # Reduced from 15 - most tasks complete in 3-5 loops
+    json_retry_count = 0
+    max_json_retries = settings.max_json_retries
+
+    while loop_count < max_loops:
         loop_count += 1
-        log.info(f"WORKER loop {loop_count} — calling LLM...")
+        log.info(f"AGENT loop {loop_count} — calling LLM...")
         response = await llm_with_tools.ainvoke(messages)
         messages.append(response)
+        log.info(f"AGENT response: {response.content[:300]}...")
 
+        # Handle tool calls - PARALLEL EXECUTION for performance
         if response.tool_calls:
-            for tool_call in response.tool_calls:
-                log.info(f"WORKER tool call: get_full_script({tool_call['args']})")
-                # Standardize parameter name (accept both script_name and name for backward compatibility)
+            import asyncio
+
+            log.info(f"AGENT executing {len(response.tool_calls)} tool call(s) in parallel")
+
+            # Prepare all tool call tasks
+            async def execute_tool(tool_call):
+                func_name = tool_call["name"]
                 args = tool_call["args"]
-                script_name = args.get("script_name") or args.get("name") or ""
-                if not script_name:
-                    log.error(f"WORKER tool call missing script_name parameter: {args}")
-                    result = "Error: script_name parameter is required"
-                else:
-                    result = await _get_full_script(script_name)
-                    log.info(f"WORKER tool result: {result[:200]}...")
-                messages.append(ToolMessage(content=result, tool_call_id=tool_call["id"]))
+                log.info(f"AGENT tool call: {func_name}({args})")
+
+                try:
+                    if func_name == "_search_project":
+                        result = await _search_project(**args)
+                    elif func_name == "_list_children":
+                        result = await _list_children(**args)
+                    elif func_name == "_get_metadata":
+                        result = await _get_metadata(**args)
+                    elif func_name == "_get_full_script":
+                        # Handle both parameter names for backward compatibility
+                        script_name = args.get("script_name") or args.get("name") or ""
+                        if not script_name:
+                            result = "Error: script_name parameter is required"
+                        else:
+                            result = await _get_full_script(script_name)
+                    else:
+                        result = f"Unknown tool: {func_name}"
+
+                    log.info(f"AGENT tool result: {result[:200]}...")
+                    return (tool_call["id"], result)
+                except Exception as e:
+                    log.error(f"AGENT tool error: {str(e)}")
+                    return (tool_call["id"], f"Error: {str(e)}")
+
+            # Execute all tool calls in parallel
+            results = await asyncio.gather(*[execute_tool(tc) for tc in response.tool_calls])
+
+            # Append results in order
+            for tool_call_id, result in results:
+                messages.append(ToolMessage(content=result, tool_call_id=tool_call_id))
+
+            # Prune old tool calls to prevent context bloat (keep last 6 tool interactions)
+            if len(messages) > 15:
+                # Keep system messages (first 2) + recent history + last 6 messages
+                messages = messages[:2] + messages[-10:]
+
             continue
 
+        # Process response content
         content = response.content
-        log.info(f"WORKER raw response: {content[:500]}...")
 
+        # Try to parse as JSON (for action requests) with aggressive extraction
+        result = None
         try:
-            if "```json" in content:
-                content = content.split("```json")[1].split("```")[0]
+            # Strategy 1: Extract from markdown code blocks (case-insensitive)
+            if "```json" in content.lower():
+                import re
+                match = re.search(r'```json\s*(.*?)\s*```', content, re.DOTALL | re.IGNORECASE)
+                if match:
+                    result = json.loads(match.group(1).strip())
             elif "```" in content:
                 content = content.split("```")[1].split("```")[0]
-            result = json.loads(content.strip())
-        except json.JSONDecodeError:
-            json_retry_count += 1
-            if json_retry_count >= max_retries:
-                log.error(f"WORKER — JSON parse failed after {max_retries} retries, returning error")
+                result = json.loads(content.strip())
+            else:
+                # Strategy 2: Try parsing as-is
+                result = json.loads(content.strip())
+
+            # Valid JSON response - return as actions
+            log.info(f"AGENT result: {json.dumps(result, indent=2)[:500]}")
+
+            # STREAMING OPTIMIZATION: Push actions to session queue immediately
+            if isinstance(result, dict) and "actions" in result:
+                log.info(f"AGENT pushing {len(result['actions'])} actions to session queue")
+                session.action_queue.extend(result["actions"])
+
+                # Track created objects in working memory
+                for action in result["actions"]:
+                    if action.get("type") in ["create_instance", "create_script"]:
+                        target = action.get("target", "")
+                        name = action.get("name", "")
+                        class_name = action.get("class_name", "")
+                        full_path = f"{target}.{name}" if name else target
+
+                        session.pending_creations[name or full_path] = {
+                            "type": class_name or action.get("type"),
+                            "target": full_path,
+                            "action_type": action.get("type")
+                        }
+                        log.info(f"AGENT tracked creation: {name or full_path} ({class_name})")
+
+            log.info("AGENT DONE (actions)")
+            return {
+                "messages": messages,
+                "final_response": result,
+            }
+
+        except (json.JSONDecodeError, AttributeError, TypeError):
+            # Not JSON - check if it's intentionally conversational
+            conversational_indicators = ["hello", "hi", "thanks", "thank you", "welcome", "sure", "okay"]
+            action_indicators = ["action", "modify", "create", "set", "change", "update", "delete"]
+
+            is_likely_conversational = (
+                any(word in content.lower() for word in conversational_indicators)
+                or (loop_count == 1 and not any(word in content.lower() for word in action_indicators))
+            )
+
+            if is_likely_conversational and not any(word in content.lower() for word in ["json", "```"]):
+                # Likely a conversational response
+                log.info(f"AGENT → conversational reply: {content[:200]}")
+                log.info("AGENT DONE (chat)")
                 return {
-                    "worker_messages": messages,
+                    "messages": messages,
+                    "final_response": {"description": content},
+                }
+
+            # JSON was expected but parsing failed - try one more aggressive extraction
+            if result is None and json_retry_count == 0:
+                import re
+                # Try to find JSON object in the response
+                json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', content, re.DOTALL)
+                if json_match:
+                    try:
+                        result = json.loads(json_match.group())
+                        if isinstance(result, dict):
+                            log.info("AGENT → recovered JSON with regex")
+                            log.info("AGENT DONE (actions)")
+                            return {
+                                "messages": messages,
+                                "final_response": result,
+                            }
+                    except:
+                        pass
+
+            # Still couldn't parse - retry with LLM
+            json_retry_count += 1
+            if json_retry_count >= max_json_retries:
+                log.error(f"AGENT — JSON parse failed after {max_json_retries} retries")
+                return {
+                    "messages": messages,
                     "final_response": {
                         "actions": [],
                         "description": "Sorry, I couldn't generate valid actions. Please try rephrasing your request.",
                     },
                 }
-            log.warning(f"WORKER — JSON parse failed (attempt {json_retry_count}/{max_retries}), asking for retry")
+
+            log.warning(f"AGENT — JSON parse failed (attempt {json_retry_count}/{max_json_retries})")
             messages.append(HumanMessage(
-                content="Your response was not valid JSON. Please respond with ONLY the JSON object in the format specified."
+                content="Your response was not valid JSON. Please respond with ONLY the JSON object in the format specified, or with plain text if this is conversational."
             ))
             continue
 
-        log.info(f"WORKER result: {json.dumps(result, indent=2)[:500]}")
-        log.info("WORKER DONE")
-        return {
-            "worker_messages": messages,
-            "final_response": result,
-        }
-
-
-def should_run_worker(state: AgentState) -> str:
-    if state.get("final_response"):
-        return END
-    return "worker"
+    # Max loops reached
+    log.error("AGENT — max loops reached")
+    return {
+        "messages": messages,
+        "final_response": {
+            "description": "I couldn't complete that request. Please try breaking it into smaller steps.",
+        },
+    }
 
 
 def build_graph():
+    """Simplified single-node graph"""
     graph = StateGraph(AgentState)
-    graph.add_node("orchestrator", orchestrator_node)
-    graph.add_node("worker", worker_node)
-    graph.add_edge(START, "orchestrator")
-    graph.add_conditional_edges("orchestrator", should_run_worker)
-    graph.add_edge("worker", END)
+    graph.add_node("agent", unified_agent_node)
+    graph.add_edge(START, "agent")
+    graph.add_edge("agent", END)
     return graph.compile()
 
 
 async def run_agent(session: Session, user_message: str) -> dict:
+    """Run the unified agent"""
     graph = build_graph()
     result = await graph.ainvoke({
         "session": session,
         "user_message": user_message,
-        "orchestrator_messages": [],
-        "worker_task": "",
-        "worker_messages": [],
+        "messages": [],
         "final_response": {},
     })
     return result["final_response"]

@@ -95,6 +95,11 @@ async def chat(request: ChatRequest):
     Returns JSON with assistant message and actions array.
     """
     session = get_or_create_session(request.session_id, request.openrouter_key)
+
+    # Clear pending creations if project map changed (objects now reflected in actual map)
+    if session.project_map != request.project_map:
+        session.pending_creations.clear()
+
     session.project_map = request.project_map
 
     session.conversation_history.append({
