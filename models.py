@@ -52,6 +52,7 @@ class ChatResponse(BaseModel):
     message: str = Field(..., min_length=1)
     actions: list[Action] = Field(default_factory=list)
     metadata_updates: dict[str, str] = Field(default_factory=dict)
+    plan: dict = Field(default_factory=dict)  # Multi-step plan progress
 
 
 class PluginPollResponse(BaseModel):

@@ -125,6 +125,7 @@ async def chat(request: ChatRequest):
         message=assistant_message,
         actions=actions,
         metadata_updates=result.get("metadata_updates", {}),
+        plan=result.get("plan", {}),
     )
 
 

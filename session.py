@@ -19,6 +19,7 @@ class Session:
     fulfilled_data: dict[str, dict] = field(default_factory=dict)
     action_queue: list[dict] = field(default_factory=list)
     pending_creations: dict[str, dict] = field(default_factory=dict)  # Track recently created objects
+    active_plan: dict = field(default_factory=dict)  # {"steps": [...], "current_step": 0, "description": "..."}
     created_at: float = field(default_factory=time.time)
     last_accessed: float = field(default_factory=time.time)
 

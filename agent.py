@@ -48,18 +48,67 @@ def format_pending_creations(pending: dict) -> str:
 
 UNIFIED_SYSTEM = """Expert Roblox Studio AI with full game control.
 
-IMPORTANT: You receive a PARTIAL VIEW of the project (top-level containers only). Use tools to explore and locate scripts.
+CRITICAL: You receive a PARTIAL VIEW of the project (top-level containers only). The project map does NOT show scripts or detailed children. You MUST use tools to explore before making changes.
 
-Tools:
-- search_project(query): Search for scripts by name (e.g., "healing" finds "HealPlayer" script with full path)
+STEP-BY-STEP EXECUTION (CRITICAL - ALWAYS DO THIS):
+For ANY task with multiple components, you MUST work incrementally:
+
+1. ANALYZE & PLAN: Break task into logical steps (UI → Scripts → Wiring)
+2. EXECUTE ONE STEP: Use tools, create actions for ONLY the current step
+3. VERIFY: Describe what you did and what's next
+4. CONTINUE: When user responds or plan continues, do next step
+
+Multi-step tasks include:
+- Creating new systems (e.g., "add sprint and stamina" = UI + handler + events)
+- Modifying multiple scripts (each script is a step)
+- Complex features (anything with "and" or multiple components)
+
+Single-step tasks:
+- Simple property changes ("make the part red")
+- Single script modifications
+
+REQUIRED FORMAT for multi-step tasks:
+{
+  "actions": [only actions for current step],
+  "description": "Step 1/3: Created stamina UI (ScreenGui with Frame and TextLabel). Next: Creating stamina handler script.",
+  "plan": {
+    "steps": ["Create stamina UI", "Create stamina handler script", "Wire up events"],
+    "current_step": 1,
+    "total_steps": 3
+  }
+}
+
+When you see "Active Multi-Step Plan" in the context, continue with the next step immediately.
+
+REQUIRED WORKFLOW:
+1. When user mentions existing functionality (e.g., "stamina system", "player script"), use search_project() to find it
+2. Before modifying scripts, ALWAYS use get_full_script() to read current code
+3. When creating related features, search for existing systems first to avoid duplicates
+
+Tools (USE THEM PROACTIVELY):
+- search_project(query): Search for scripts/objects by name or keyword. Use this FIRST when user mentions existing features.
+  Example: search_project("stamina") finds "StaminaBar", "StaminaHandler", etc.
 - list_children(path): List contents of a game path (e.g., "game.Workspace" or "game.ServerScriptService")
-- get_metadata(script_name): Preview script (type, location, lines, deps, first few lines)
-- get_full_script(script_name): Read full source (returns Path, Hash, and Source - extract Hash for modify_script!)
+- get_metadata(script_name): Preview script (type, location, lines, first few lines) - use for quick inspection
+- get_full_script(script_name): Read full source code (returns Path, Hash, and Source)
+  REQUIRED before any modify_script action to get the hash and current code
 
-Best Practice: Use search_project() first to locate scripts by name, then get_full_script() to read them.
-Only use tools for game logic tasks, not simple property/instance changes.
+EXAMPLES:
+User: "add dash ability that uses stamina"
+❌ BAD: Create new stamina bar without checking
+✅ GOOD: search_project("stamina") → find existing StaminaBar → use it
 
-HASH VERIFICATION: get_full_script() returns a "Hash: ..." line. When creating modify_script actions, copy this hash value to original_hash field to prevent data loss from concurrent edits.
+User: "modify the player movement script"
+❌ BAD: Guess the script location
+✅ GOOD: search_project("movement") or search_project("player") → get_full_script() → modify
+
+Only skip tools for simple property changes that don't involve scripts.
+
+HASH VERIFICATION (CRITICAL):
+- get_full_script() returns a "Hash: ..." line
+- You MUST copy this hash value to the original_hash field in modify_script actions
+- This prevents data loss from concurrent edits
+- If you modify a script without the hash, it will fail
 
 Output:
 - Conversational: Plain text
@@ -84,7 +133,9 @@ Rules:
 - BrickColor: "Bright red", Enums: "Enum.Material.Grass"
 - Full paths from "game.", complete source for script modifications
 - Set all relevant properties on create, break complex tasks into multiple actions
-- CRITICAL: When modifying scripts, you MUST first call get_full_script() to read the current source, then include the hash in the modify_script action to prevent data loss"""
+- CRITICAL: When modifying scripts, you MUST first call get_full_script() to read the current source, then include the hash in the modify_script action to prevent data loss
+
+REMEMBER: The project map is incomplete. When in doubt, USE TOOLS to explore. Don't guess - search first!"""
 
 
 async def unified_agent_node(state: AgentState) -> dict:
@@ -118,15 +169,49 @@ async def unified_agent_node(state: AgentState) -> dict:
     if session.pending_creations:
         pending_context = f"\n\n# Recently Created Objects (not yet in project map)\n{format_pending_creations(session.pending_creations)}"
 
+    # Check for active plan and auto-continue
+    plan_context = ""
+    auto_continue_plan = False
+    if session.active_plan and session.active_plan.get("steps"):
+        current = session.active_plan.get("current_step", 0)
+        total = session.active_plan.get("total_steps", 0)
+        steps = session.active_plan.get("steps", [])
+        completed_steps = steps[:current] if current > 0 else []
+        next_step = steps[current] if current < len(steps) else None
+
+        # Auto-continue if user message is simple continuation trigger
+        user_msg_lower = state['user_message'].lower().strip()
+        if user_msg_lower in ["continue", "next", "next step", "go on", "proceed", "ok", "yes"]:
+            auto_continue_plan = True
+
+        if next_step and auto_continue_plan:
+            plan_context = f"\n\n# CONTINUING MULTI-STEP PLAN\n"
+            plan_context += f"Progress: {current}/{total} steps completed\n\n"
+            if completed_steps:
+                plan_context += "Completed:\n" + "\n".join(f"  ✓ {s}" for s in completed_steps) + "\n\n"
+            plan_context += f"NOW EXECUTING: {next_step}\n\n"
+            if current + 1 < len(steps):
+                plan_context += "Upcoming: " + ", ".join(steps[current + 1:]) + "\n\n"
+
+            plan_context += f"USER REQUESTED CONTINUATION. Execute step {current + 1} now:\n"
+            plan_context += f"1. Use tools if needed to explore/read code\n"
+            plan_context += f"2. Create actions for '{next_step}' ONLY\n"
+            plan_context += f"3. Return with updated plan showing current_step={current + 1}"
+        elif next_step:
+            # Show plan status but don't auto-continue
+            plan_context = f"\n\n# Active Plan: Step {current}/{total} completed\n"
+            plan_context += f"Next step: {next_step}\n"
+            plan_context += "(User can say 'continue' to proceed)"
+
     messages = [
         SystemMessage(content=UNIFIED_SYSTEM),
         # Project map as separate system message for better caching
-        SystemMessage(content=f"# Current Project Structure\n{session.project_map}{pending_context}")
+        SystemMessage(content=f"# Current Project Structure\n{session.project_map}{pending_context}{plan_context}")
     ]
 
-    # Include recent conversation history with sliding window (last 10 messages)
-    MAX_HISTORY_MESSAGES = 10
-    recent_history = session.conversation_history[:-1]
+    # Include recent conversation history with sliding window (last 20 messages)
+    MAX_HISTORY_MESSAGES = 20
+    recent_history = session.conversation_history[:-1] if session.conversation_history else []
     if len(recent_history) > MAX_HISTORY_MESSAGES:
         recent_history = recent_history[-MAX_HISTORY_MESSAGES:]
 
@@ -195,10 +280,18 @@ async def unified_agent_node(state: AgentState) -> dict:
             for tool_call_id, result in results:
                 messages.append(ToolMessage(content=result, tool_call_id=tool_call_id))
 
-            # Prune old tool calls to prevent context bloat (keep last 6 tool interactions)
-            if len(messages) > 15:
-                # Keep system messages (first 2) + recent history + last 6 messages
-                messages = messages[:2] + messages[-10:]
+            # Prune old tool calls to prevent context bloat, but preserve conversation history
+            if len(messages) > 40:
+                # Keep: system messages (first 2) + conversation history + recent tool calls
+                system_msgs = messages[:2]
+                conversation_msgs = messages[2:2+len(recent_history)]
+                current_turn = messages[2+len(recent_history):]
+
+                # Keep last 20 messages of current turn (includes tool calls)
+                if len(current_turn) > 20:
+                    current_turn = current_turn[-20:]
+
+                messages = system_msgs + conversation_msgs + current_turn
 
             continue
 
@@ -243,6 +336,35 @@ async def unified_agent_node(state: AgentState) -> dict:
                             "action_type": action.get("type")
                         }
                         log.info(f"AGENT tracked creation: {name or full_path} ({class_name})")
+
+                # Handle multi-step plan tracking
+                if "plan" in result:
+                    plan = result["plan"]
+                    current_step = plan.get("current_step", 1)
+                    total_steps = plan.get("total_steps", 1)
+
+                    # If this is a new plan or different plan, initialize it
+                    if not session.active_plan or session.active_plan.get("steps") != plan.get("steps"):
+                        session.active_plan = {
+                            "steps": plan.get("steps", []),
+                            "current_step": current_step,
+                            "total_steps": total_steps,
+                            "description": result.get("description", "")
+                        }
+                        log.info(f"AGENT new plan initialized: step {current_step}/{total_steps}")
+                    else:
+                        # Continuing existing plan - increment the step
+                        session.active_plan["current_step"] = current_step + 1
+                        log.info(f"AGENT plan advanced: step {current_step + 1}/{total_steps}")
+
+                    # Clear plan if completed
+                    if current_step >= total_steps:
+                        log.info("AGENT plan complete, clearing")
+                        session.active_plan = {}
+                elif not result.get("actions"):
+                    # No actions and no plan means conversational response
+                    # Don't clear plan unless user explicitly started a new task
+                    pass
 
             log.info("AGENT DONE (actions)")
             return {
