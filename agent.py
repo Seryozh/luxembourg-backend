@@ -121,6 +121,23 @@ Rules:
 - CRITICAL: When modifying scripts, you MUST first call get_full_script() to read the current source, then include the hash in the modify_script action to prevent data loss
 - COMPLETE THE FULL TASK - do not ask user to "continue" or split into steps
 
+LUA CODE QUALITY (CRITICAL):
+When writing Lua scripts, you MUST follow proper syntax:
+- Every 'if' MUST have a matching 'end'
+- Every 'function' MUST have a matching 'end'
+- Every 'for' and 'while' loop MUST have a matching 'end'
+- Use 'elseif' NOT 'else if' for chained conditions
+- Proper structure:
+  if condition then
+      -- code
+  elseif other_condition then
+      -- code
+  else
+      -- code
+  end
+- NEVER write 'if ... then' followed immediately by another 'if' without closing the first
+- Test your code mentally - count your 'end' statements!
+
 REMEMBER: The project map is incomplete. When in doubt, USE TOOLS to explore. Don't guess - search first!"""
 
 

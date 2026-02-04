@@ -32,8 +32,12 @@ class Session:
 
     def compute_action_hash(self, action: dict) -> str:
         """Compute a hash for an action to detect duplicates"""
-        # Create a stable string representation
+        # Create a stable string representation including source for scripts
         action_str = f"{action.get('type')}:{action.get('target')}:{action.get('name', '')}:{action.get('class_name', '')}"
+        # Include source hash for script actions to differentiate by content
+        if action.get('type') in ['create_script', 'modify_script'] and action.get('source'):
+            source_hash = hashlib.md5(action['source'].encode()).hexdigest()[:8]
+            action_str += f":{source_hash}"
         return hashlib.md5(action_str.encode()).hexdigest()[:12]
 
     def queue_actions_deduplicated(self, actions: list[dict]) -> list[dict]:
