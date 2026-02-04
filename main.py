@@ -96,9 +96,11 @@ async def chat(request: ChatRequest):
     """
     session = get_or_create_session(request.session_id, request.openrouter_key)
 
-    # Clear pending creations if project map changed (objects now reflected in actual map)
+    # Clear caches if project map changed (objects now reflected in actual map)
     if session.project_map != request.project_map:
-        session.pending_creations.clear()
+        session.clear_caches()
+        # Also clear executed action hashes since project state changed
+        session.executed_action_hashes.clear()
 
     session.project_map = request.project_map
 
@@ -125,7 +127,6 @@ async def chat(request: ChatRequest):
         message=assistant_message,
         actions=actions,
         metadata_updates=result.get("metadata_updates", {}),
-        plan=result.get("plan", {}),
     )
 
 

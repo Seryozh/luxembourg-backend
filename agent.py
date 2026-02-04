@@ -50,35 +50,20 @@ UNIFIED_SYSTEM = """Expert Roblox Studio AI with full game control.
 
 CRITICAL: You receive a PARTIAL VIEW of the project (top-level containers only). The project map does NOT show scripts or detailed children. You MUST use tools to explore before making changes.
 
-STEP-BY-STEP EXECUTION (CRITICAL - ALWAYS DO THIS):
-For ANY task with multiple components, you MUST work incrementally:
+EXECUTION MODEL - COMPLETE THE ENTIRE TASK:
+You must complete the ENTIRE task in a single response. Do NOT split work into multiple steps requiring user continuation.
 
-1. ANALYZE & PLAN: Break task into logical steps (UI → Scripts → Wiring)
-2. EXECUTE ONE STEP: Use tools, create actions for ONLY the current step
-3. VERIFY: Describe what you did and what's next
-4. CONTINUE: When user responds or plan continues, do next step
+For complex tasks:
+1. EXPLORE: Use tools to understand the current state
+2. PLAN INTERNALLY: Figure out everything needed (UI, scripts, wiring)
+3. EXECUTE ALL: Return ALL actions needed to complete the task
+4. EXPLAIN: Describe what you created/modified
 
-Multi-step tasks include:
-- Creating new systems (e.g., "add sprint and stamina" = UI + handler + events)
-- Modifying multiple scripts (each script is a step)
-- Complex features (anything with "and" or multiple components)
-
-Single-step tasks:
-- Simple property changes ("make the part red")
-- Single script modifications
-
-REQUIRED FORMAT for multi-step tasks:
-{
-  "actions": [only actions for current step],
-  "description": "Step 1/3: Created stamina UI (ScreenGui with Frame and TextLabel). Next: Creating stamina handler script.",
-  "plan": {
-    "steps": ["Create stamina UI", "Create stamina handler script", "Wire up events"],
-    "current_step": 1,
-    "total_steps": 3
-  }
-}
-
-When you see "Active Multi-Step Plan" in the context, continue with the next step immediately.
+Example: "Add sprint with stamina bar"
+- Create the ScreenGui, Frame, and bar UI elements
+- Create the stamina handler LocalScript
+- Create the sprint detection script
+- ALL in one response with ALL actions
 
 REQUIRED WORKFLOW:
 1. When user mentions existing functionality (e.g., "stamina system", "player script"), use search_project() to find it
@@ -115,7 +100,7 @@ Output:
 - Modifications: JSON with actions array
 
 JSON Format:
-{"actions": [<action_objects>], "description": "summary", "metadata_updates": {}}
+{"actions": [<action_objects>], "description": "summary of everything done"}
 
 Action Types:
 - set_property: {"type": "set_property", "target": "game.Lighting", "properties": {"ClockTime": 0}}
@@ -132,8 +117,9 @@ Rules:
 - Vector3/Color3/UDim2: use arrays [x,y,z] / [r,g,b 0-255] / [xS,xO,yS,yO]
 - BrickColor: "Bright red", Enums: "Enum.Material.Grass"
 - Full paths from "game.", complete source for script modifications
-- Set all relevant properties on create, break complex tasks into multiple actions
+- Set all relevant properties on create
 - CRITICAL: When modifying scripts, you MUST first call get_full_script() to read the current source, then include the hash in the modify_script action to prevent data loss
+- COMPLETE THE FULL TASK - do not ask user to "continue" or split into steps
 
 REMEMBER: The project map is incomplete. When in doubt, USE TOOLS to explore. Don't guess - search first!"""
 
@@ -169,44 +155,10 @@ async def unified_agent_node(state: AgentState) -> dict:
     if session.pending_creations:
         pending_context = f"\n\n# Recently Created Objects (not yet in project map)\n{format_pending_creations(session.pending_creations)}"
 
-    # Check for active plan and auto-continue
-    plan_context = ""
-    auto_continue_plan = False
-    if session.active_plan and session.active_plan.get("steps"):
-        current = session.active_plan.get("current_step", 0)
-        total = session.active_plan.get("total_steps", 0)
-        steps = session.active_plan.get("steps", [])
-        completed_steps = steps[:current] if current > 0 else []
-        next_step = steps[current] if current < len(steps) else None
-
-        # Auto-continue if user message is simple continuation trigger
-        user_msg_lower = state['user_message'].lower().strip()
-        if user_msg_lower in ["continue", "next", "next step", "go on", "proceed", "ok", "yes"]:
-            auto_continue_plan = True
-
-        if next_step and auto_continue_plan:
-            plan_context = f"\n\n# CONTINUING MULTI-STEP PLAN\n"
-            plan_context += f"Progress: {current}/{total} steps completed\n\n"
-            if completed_steps:
-                plan_context += "Completed:\n" + "\n".join(f"  ✓ {s}" for s in completed_steps) + "\n\n"
-            plan_context += f"NOW EXECUTING: {next_step}\n\n"
-            if current + 1 < len(steps):
-                plan_context += "Upcoming: " + ", ".join(steps[current + 1:]) + "\n\n"
-
-            plan_context += f"USER REQUESTED CONTINUATION. Execute step {current + 1} now:\n"
-            plan_context += f"1. Use tools if needed to explore/read code\n"
-            plan_context += f"2. Create actions for '{next_step}' ONLY\n"
-            plan_context += f"3. Return with updated plan showing current_step={current + 1}"
-        elif next_step:
-            # Show plan status but don't auto-continue
-            plan_context = f"\n\n# Active Plan: Step {current}/{total} completed\n"
-            plan_context += f"Next step: {next_step}\n"
-            plan_context += "(User can say 'continue' to proceed)"
-
     messages = [
         SystemMessage(content=UNIFIED_SYSTEM),
         # Project map as separate system message for better caching
-        SystemMessage(content=f"# Current Project Structure\n{session.project_map}{pending_context}{plan_context}")
+        SystemMessage(content=f"# Current Project Structure\n{session.project_map}{pending_context}")
     ]
 
     # Include recent conversation history with sliding window (last 20 messages)
@@ -317,10 +269,10 @@ async def unified_agent_node(state: AgentState) -> dict:
             # Valid JSON response - return as actions
             log.info(f"AGENT result: {json.dumps(result, indent=2)[:500]}")
 
-            # STREAMING OPTIMIZATION: Push actions to session queue immediately
+            # STREAMING OPTIMIZATION: Push actions to session queue with deduplication
             if isinstance(result, dict) and "actions" in result:
-                log.info(f"AGENT pushing {len(result['actions'])} actions to session queue")
-                session.action_queue.extend(result["actions"])
+                newly_queued = session.queue_actions_deduplicated(result["actions"])
+                log.info(f"AGENT pushing {len(newly_queued)}/{len(result['actions'])} actions (deduplicated)")
 
                 # Track created objects in working memory
                 for action in result["actions"]:
@@ -336,35 +288,6 @@ async def unified_agent_node(state: AgentState) -> dict:
                             "action_type": action.get("type")
                         }
                         log.info(f"AGENT tracked creation: {name or full_path} ({class_name})")
-
-                # Handle multi-step plan tracking
-                if "plan" in result:
-                    plan = result["plan"]
-                    current_step = plan.get("current_step", 1)
-                    total_steps = plan.get("total_steps", 1)
-
-                    # If this is a new plan or different plan, initialize it
-                    if not session.active_plan or session.active_plan.get("steps") != plan.get("steps"):
-                        session.active_plan = {
-                            "steps": plan.get("steps", []),
-                            "current_step": current_step,
-                            "total_steps": total_steps,
-                            "description": result.get("description", "")
-                        }
-                        log.info(f"AGENT new plan initialized: step {current_step}/{total_steps}")
-                    else:
-                        # Continuing existing plan - increment the step
-                        session.active_plan["current_step"] = current_step + 1
-                        log.info(f"AGENT plan advanced: step {current_step + 1}/{total_steps}")
-
-                    # Clear plan if completed
-                    if current_step >= total_steps:
-                        log.info("AGENT plan complete, clearing")
-                        session.active_plan = {}
-                elif not result.get("actions"):
-                    # No actions and no plan means conversational response
-                    # Don't clear plan unless user explicitly started a new task
-                    pass
 
             log.info("AGENT DONE (actions)")
             return {

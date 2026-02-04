@@ -1,6 +1,7 @@
 import asyncio
 import uuid
 import time
+import hashlib
 from dataclasses import dataclass, field
 
 from config import settings
@@ -18,10 +19,33 @@ class Session:
     fulfilled_responses: dict[str, asyncio.Event] = field(default_factory=dict)
     fulfilled_data: dict[str, dict] = field(default_factory=dict)
     action_queue: list[dict] = field(default_factory=list)
+    executed_action_hashes: set = field(default_factory=set)  # Track executed actions for idempotency
     pending_creations: dict[str, dict] = field(default_factory=dict)  # Track recently created objects
-    active_plan: dict = field(default_factory=dict)  # {"steps": [...], "current_step": 0, "description": "..."}
     created_at: float = field(default_factory=time.time)
     last_accessed: float = field(default_factory=time.time)
+
+    def clear_caches(self):
+        """Clear all caches when project state changes"""
+        self.cached_metadata.clear()
+        self.cached_scripts.clear()
+        self.pending_creations.clear()
+
+    def compute_action_hash(self, action: dict) -> str:
+        """Compute a hash for an action to detect duplicates"""
+        # Create a stable string representation
+        action_str = f"{action.get('type')}:{action.get('target')}:{action.get('name', '')}:{action.get('class_name', '')}"
+        return hashlib.md5(action_str.encode()).hexdigest()[:12]
+
+    def queue_actions_deduplicated(self, actions: list[dict]) -> list[dict]:
+        """Queue actions with deduplication. Returns list of newly queued actions."""
+        newly_queued = []
+        for action in actions:
+            action_hash = self.compute_action_hash(action)
+            if action_hash not in self.executed_action_hashes:
+                self.executed_action_hashes.add(action_hash)
+                self.action_queue.append(action)
+                newly_queued.append(action)
+        return newly_queued
 
 
 _sessions: dict[str, Session] = {}
